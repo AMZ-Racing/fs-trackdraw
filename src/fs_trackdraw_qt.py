@@ -2,20 +2,32 @@ import os
 import math
 import csv
 import numpy as np
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                            QPushButton, QLineEdit, QFileDialog, QMessageBox)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+                            QPushButton, QLineEdit, QFileDialog, QMessageBox, QCheckBox, QSizePolicy)
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPixmap
 import yaml
-from scipy.interpolate import splprep, splev
-from utils_qt import (create_closed_spline, generate_offset_boundaries, sample_cones, generate_oneside_boundary)
+from utils_qt import (
+    create_closed_spline,
+    generate_oneside_boundary,
+    generate_variable_offset_boundaries,
+    sample_cones_variable,
+    compute_curvature_profile,
+)
 from track_canvas_qt import TrackCanvas
+from parameter_function import ParameterFunction
+from function_editor_qt import FunctionEditorDialog
+from min_curvature_calculation import optimize_raceline
 
 
 class FSTrackDraw(QMainWindow):
+    CURVATURE_ALERT_THRESHOLD = 1.0 / 4.5  # 1/m (diameter 9 m => radius 4.5 m)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TrackDraw - PyQt")
+        self.setMinimumSize(1024, 720)
+        self.resize(1280, 860)
         
         # Global configuration file
         self.config_file = "config/track_config.yaml"
@@ -26,6 +38,29 @@ class FSTrackDraw(QMainWindow):
             self.min_boundary_backoff = config.get('min_boundary_backoff', 10.0)
             self.n_points_midline = config.get('n_points_midline', 300)
             self.location_name = config.get('standard_location', "empty")
+
+        # Parameter functions over track progress
+        self.track_width_function = ParameterFunction(self.track_width, name="Track Width")
+        self.cone_spacing_function = ParameterFunction(self.default_cone_distance, name="Cone Spacing")
+
+        # Auto spacing parameters (meters)
+        self.auto_spacing_multiplier = 0.7
+        self.auto_spacing_min_spacing = 1.0
+        self.auto_spacing_max_spacing = 5.0
+
+        # Randomization controls
+        self.control_point_nudge_amount_m = 0.3
+        self.cone_spacing_jitter_enabled = False
+        self.cone_spacing_jitter_amount = 0.1
+        self.cone_spacing_jitter_function = None
+        self._cone_spacing_random_sample_index = 0
+        self.centerline_warn_segments = []
+        self.left_boundary_warn_segments = []
+        self.right_boundary_warn_segments = []
+        self.curvature_analysis_green_segments = []
+        self.curvature_analysis_red_segments = []
+        self.curvature_clearance_m = 0.5
+        self.curvature_spacing_sequence = [1.0, 0.7, 0.2]
 
         # Load the location-specific details
         self.folderpath_location = "location_images/" + self.location_name
@@ -40,13 +75,15 @@ class FSTrackDraw(QMainWindow):
         # Create main widget and layout
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
-        
+
         self.main_layout = QHBoxLayout(self.main_widget)
         self.main_layout.setContentsMargins(5, 5, 5, 5)
-        
+
         # Create canvas (handles its own obstacle loading with proper scaling)
         self.canvas = TrackCanvas(self)
-        self.canvas.setMinimumSize(600, 600)
+        self.canvas.setMinimumSize(500, 500)
+        self.main_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.main_layout.addWidget(self.canvas, 1)
         
         # Right-side UI
@@ -73,7 +110,21 @@ class FSTrackDraw(QMainWindow):
         self.move_button = QPushButton("Move Control Point")
         self.move_button.clicked.connect(self.activate_move_mode)
         self.ui_layout.addWidget(self.move_button)
-        
+
+        self.ui_layout.addWidget(QLabel("Control point random nudge (m):"))
+        self.control_point_nudge_entry = QLineEdit(f"{self.control_point_nudge_amount_m:.3f}")
+        self.control_point_nudge_entry.setToolTip("Maximum absolute displacement applied per control point when randomizing")
+        self.control_point_nudge_entry.editingFinished.connect(self.update_control_point_nudge_amount)
+        self.ui_layout.addWidget(self.control_point_nudge_entry)
+
+        self.randomize_control_points_button = QPushButton("Randomize Control Points")
+        self.randomize_control_points_button.setToolTip("Apply random jitters to the current control points within the specified distance")
+        self.randomize_control_points_button.clicked.connect(self.randomize_control_points)
+        self.ui_layout.addWidget(self.randomize_control_points_button)
+
+        self.control_point_random_status_label = QLabel("Control point randomization: not applied")
+        self.ui_layout.addWidget(self.control_point_random_status_label)
+
         # Swap boundaries button
         self.swap_button = QPushButton("Swap Boundaries")
         self.swap_button.clicked.connect(self.swap_boundaries)
@@ -87,14 +138,66 @@ class FSTrackDraw(QMainWindow):
         # Cone spacing input
         self.ui_layout.addWidget(QLabel("Cone spacing (m):"))
         self.cone_spacing_entry = QLineEdit(str(self.default_cone_distance))
-        self.cone_spacing_entry.returnPressed.connect(self.redraw)
+        self.cone_spacing_entry.returnPressed.connect(self.update_cone_spacing_constant)
         self.ui_layout.addWidget(self.cone_spacing_entry)
+
+        self.edit_cone_spacing_button = QPushButton("Edit Cone Spacing Function")
+        self.edit_cone_spacing_button.clicked.connect(self.open_cone_spacing_editor)
+        self.ui_layout.addWidget(self.edit_cone_spacing_button)
+
+        self.auto_spacing_checkbox = QCheckBox("Auto spacing from curvature")
+        self.auto_spacing_checkbox.stateChanged.connect(self.toggle_auto_spacing)
+        self.ui_layout.addWidget(self.auto_spacing_checkbox)
+
+        self.cone_spacing_random_checkbox = QCheckBox("Enable cone spacing randomness")
+        self.cone_spacing_random_checkbox.stateChanged.connect(self.toggle_cone_spacing_randomness)
+        self.cone_spacing_random_checkbox.setToolTip("Apply random variation to cone spacing values when enabled")
+        self.ui_layout.addWidget(self.cone_spacing_random_checkbox)
+
+        self.ui_layout.addWidget(QLabel("Cone spacing randomness amount"))
+        self.cone_spacing_random_amount_entry = QLineEdit(f"{self.cone_spacing_jitter_amount:.3f}")
+        self.cone_spacing_random_amount_entry.setToolTip("Maximum fractional jitter (e.g. 0.10 = ±10%)")
+        self.cone_spacing_random_amount_entry.editingFinished.connect(self.update_cone_spacing_jitter_amount)
+        self.cone_spacing_random_amount_entry.setEnabled(False)
+        self.ui_layout.addWidget(self.cone_spacing_random_amount_entry)
+
+        self.randomize_cone_spacing_button = QPushButton("Randomize Cone Spacing")
+        self.randomize_cone_spacing_button.setToolTip("Generate a new random cone spacing profile using the jitter amount")
+        self.randomize_cone_spacing_button.clicked.connect(lambda: self.randomize_cone_spacing_profile())
+        self.randomize_cone_spacing_button.setEnabled(False)
+        self.ui_layout.addWidget(self.randomize_cone_spacing_button)
+
+        self.cone_spacing_random_status_label = QLabel("Cone spacing randomness: disabled")
+        self.ui_layout.addWidget(self.cone_spacing_random_status_label)
+
+        self.check_curvature_button = QPushButton("Check Curvature")
+        self.check_curvature_button.setToolTip(
+            "Compute the minimum-curvature path and highlight sections tighter than 4.5 m radius"
+        )
+        self.check_curvature_button.clicked.connect(self.check_curvature)
+        self.ui_layout.addWidget(self.check_curvature_button)
+
+        self.curvature_check_status_label = QLabel("Curvature check: not run")
+        self.ui_layout.addWidget(self.curvature_check_status_label)
+        self.clear_curvature_analysis()
+
+        self.ui_layout.addWidget(QLabel("Curvature clearance (m):"))
+        self.curvature_clearance_entry = QLineEdit("0.50")
+        self.curvature_clearance_entry.setToolTip("Minimum clearance passed to the curvature optimizer")
+        self.curvature_clearance_entry.editingFinished.connect(self._sync_curvature_clearance)
+        self.ui_layout.addWidget(self.curvature_clearance_entry)
 
         # Track width input
         self.ui_layout.addWidget(QLabel("Track width (m):"))
         self.track_width_entry = QLineEdit(str(self.track_width))
-        self.track_width_entry.returnPressed.connect(self.redraw)
+        self.track_width_entry.returnPressed.connect(self.update_track_width_constant)
         self.ui_layout.addWidget(self.track_width_entry)
+
+        self.edit_track_width_button = QPushButton("Edit Track Width Function")
+        self.edit_track_width_button.clicked.connect(self.open_track_width_editor)
+        self.ui_layout.addWidget(self.edit_track_width_button)
+
+        self._update_auto_spacing_tooltip()
 
         # Barrier Mode Label
         self.barrier_mode_label = QLabel("Barrier Mode: Add")
@@ -150,6 +253,14 @@ class FSTrackDraw(QMainWindow):
         self.centerline = None
         self.left_boundary = None
         self.right_boundary = None
+        self.left_cones = None
+        self.right_cones = None
+        self.curvature_progress = None
+        self.curvature_values = None
+        self.curvature_spacing_profile = None
+        self.centerline_warn_segments = []
+        self.left_boundary_warn_segments = []
+        self.right_boundary_warn_segments = []
         self.boundaries_swapped = False
         self.barrier_offset_swapped = False
         self.perform_swap = False
@@ -173,6 +284,9 @@ class FSTrackDraw(QMainWindow):
         # Initial logo setup
         self.update_logo_size()
         
+        # Initialize auto spacing controls to manual mode
+        self.toggle_auto_spacing(Qt.Unchecked)
+
         # Initialize
         self.redraw()
 
@@ -191,6 +305,238 @@ class FSTrackDraw(QMainWindow):
           )
           self.logo_label.setPixmap(scaled_pixmap)
           self.logo_label.setFixedSize(scaled_pixmap.size())  # Prevent layout shifting
+
+
+    def update_cone_spacing_constant(self):
+        try:
+            value = float(self.cone_spacing_entry.text())
+        except ValueError:
+            value = self.default_cone_distance
+        self.cone_spacing_function.set_constant(value)
+        self.default_cone_distance = value
+        self.cone_spacing_entry.setText(f"{value:.3f}")
+        self.redraw()
+
+    def update_track_width_constant(self):
+        try:
+            value = float(self.track_width_entry.text())
+        except ValueError:
+            value = self.track_width
+        self.track_width_function.set_constant(value)
+        self.track_width = value
+        self.track_width_entry.setText(f"{value:.3f}")
+        self.redraw()
+
+    def open_cone_spacing_editor(self):
+        dialog = FunctionEditorDialog(
+            self,
+            self.cone_spacing_function,
+            "Cone Spacing Function",
+            units="m",
+            reference=self.get_curvature_reference(),
+            auto_spacing_params={
+                "multiplier": self.auto_spacing_multiplier,
+                "min": self.auto_spacing_min_spacing,
+                "max": self.auto_spacing_max_spacing,
+            },
+            auto_spacing_callback=self.set_auto_spacing_params,
+        )
+        if dialog.exec_():
+            self.cone_spacing_entry.setText(f"{self.cone_spacing_function.evaluate(0.0):.3f}")
+            self.redraw()
+
+    def open_track_width_editor(self):
+        dialog = FunctionEditorDialog(
+            self,
+            self.track_width_function,
+            "Track Width Function",
+            units="m",
+            reference=self.get_curvature_reference(),
+        )
+        if dialog.exec_():
+            self.track_width_entry.setText(f"{self.track_width_function.evaluate(0.0):.3f}")
+            self.redraw()
+
+    def toggle_auto_spacing(self, state):
+        enabled = state == Qt.Checked
+        self.cone_spacing_entry.setEnabled(not enabled)
+        # Still allow opening the editor so curvature parameters remain adjustable
+        self.edit_cone_spacing_button.setEnabled(True)
+        if enabled:
+            if self.curvature_spacing_profile is None:
+                self.cone_spacing_entry.setToolTip("Auto spacing requires a computed track curvature")
+            else:
+                self.cone_spacing_entry.setToolTip(self._auto_spacing_formula_text())
+        else:
+            self.cone_spacing_entry.setToolTip("")
+        # Trigger redraw so cone placement updates with new mode
+        self.redraw()
+
+    def update_control_point_nudge_amount(self):
+        self.control_point_nudge_amount_m = self._parse_positive_line_edit(
+            self.control_point_nudge_entry,
+            self.control_point_nudge_amount_m,
+            minimum=0.0,
+        )
+
+    def randomize_control_points(self):
+        if not self.control_points:
+            return
+        amount_m = self.control_point_nudge_amount_m
+        if amount_m <= 0:
+            return
+        amount_px = amount_m * self.px_per_m
+        rng = np.random.default_rng()
+        nudged = []
+        for pt in self.control_points:
+            dx, dy = rng.uniform(-amount_px, amount_px, size=2)
+            nudged.append(QPointF(pt.x() + dx, pt.y() + dy))
+        self.control_points = nudged
+        self.control_point_random_status_label.setText(
+            f"Control point randomization applied: ±{amount_m:.3f} m"
+        )
+        self.redraw()
+
+    def _auto_spacing_formula_text(self) -> str:
+        return (
+            "spacing = clamp({mult:.3f} / κ, {min:.3f}, {max:.3f})\n"
+            "κ is curvature (1/m); spacing is in meters."
+        ).format(
+            mult=self.auto_spacing_multiplier,
+            min=self.auto_spacing_min_spacing,
+            max=self.auto_spacing_max_spacing,
+        )
+
+    def _update_auto_spacing_tooltip(self):
+        tooltip = (
+            "Auto spacing from curvature uses the latest parameters set in the editor:\n"
+            f"{self._auto_spacing_formula_text()}"
+        )
+        self.auto_spacing_checkbox.setToolTip(tooltip)
+
+    def set_auto_spacing_params(self, multiplier: float, min_spacing: float, max_spacing: float):
+        if multiplier <= 0:
+            multiplier = self.auto_spacing_multiplier
+        if min_spacing <= 0:
+            min_spacing = self.auto_spacing_min_spacing
+        if max_spacing < min_spacing:
+            max_spacing = min_spacing
+
+        self.auto_spacing_multiplier = float(multiplier)
+        self.auto_spacing_min_spacing = float(min_spacing)
+        self.auto_spacing_max_spacing = float(max_spacing)
+
+        self._update_auto_spacing_tooltip()
+
+        if self.auto_spacing_checkbox.isChecked():
+            self.redraw()
+
+    def update_cone_spacing_jitter_amount(self):
+        self.cone_spacing_jitter_amount = self._parse_positive_line_edit(
+            self.cone_spacing_random_amount_entry,
+            self.cone_spacing_jitter_amount,
+            minimum=0.0,
+        )
+        if self.cone_spacing_jitter_enabled:
+            self.randomize_cone_spacing_profile()
+
+    def toggle_cone_spacing_randomness(self, state):
+        enabled = state == Qt.Checked
+        self.cone_spacing_jitter_enabled = enabled
+        self.cone_spacing_random_amount_entry.setEnabled(enabled)
+        self.randomize_cone_spacing_button.setEnabled(enabled)
+        if enabled:
+            self.cone_spacing_random_status_label.setText("Cone spacing randomness: active")
+            self.randomize_cone_spacing_profile()
+        else:
+            self.cone_spacing_jitter_function = None
+            self._cone_spacing_random_sample_index = 0
+            self.cone_spacing_random_status_label.setText("Cone spacing randomness: disabled")
+            self.redraw()
+
+    def randomize_cone_spacing_profile(self, redraw: bool = True):
+        if not self.cone_spacing_jitter_enabled:
+            return
+        amount = max(0.0, float(self.cone_spacing_jitter_amount))
+        # Clamp to avoid zero or negative factors
+        amount = min(amount, 0.95)
+        if not np.isclose(amount, self.cone_spacing_jitter_amount):
+            self.cone_spacing_jitter_amount = amount
+            self.cone_spacing_random_amount_entry.setText(f"{self.cone_spacing_jitter_amount:.3f}")
+
+        num_points = max(8, self.n_points_midline // 6)
+        progress = np.linspace(0.0, 1.0, num_points, endpoint=False)
+        rng = np.random.default_rng()
+        lower = max(0.05, 1.0 - amount)
+        upper = 1.0 + amount
+        factors = rng.uniform(lower, upper, size=progress.shape)
+        control_points = list(zip(progress, factors))
+        control_points.append((1.0, factors[0]))
+        jitter_function = ParameterFunction(1.0, name="Cone Spacing Jitter")
+        jitter_function.set_control_points(control_points)
+        self.cone_spacing_jitter_function = jitter_function
+        self._cone_spacing_random_sample_index += 1
+        self.cone_spacing_random_status_label.setText(
+            "Cone spacing randomness sample #{idx} (±{amt:.3f})".format(
+                idx=self._cone_spacing_random_sample_index,
+                amt=self.cone_spacing_jitter_amount,
+            )
+        )
+        if redraw:
+            self.redraw()
+
+    def _compute_spacing_profile(self, curvature_values):
+        curvature = np.asarray(curvature_values, dtype=float)
+        if curvature.size == 0:
+            return np.array([], dtype=float)
+        denom = np.maximum(curvature, 1e-6)
+        spacing = self.auto_spacing_multiplier / denom
+        spacing = np.clip(spacing, self.auto_spacing_min_spacing, self.auto_spacing_max_spacing)
+        return spacing
+
+    def get_spacing_sampler(self):
+        if self.auto_spacing_checkbox.isChecked() and self.curvature_spacing_profile is not None:
+            base_sampler = self.curvature_spacing_sampler
+        else:
+            base_sampler = self.cone_spacing_function.evaluate_array
+
+        if self.cone_spacing_jitter_enabled and self.cone_spacing_jitter_function is not None:
+            jitter_function = self.cone_spacing_jitter_function
+
+            def jittered_sampler(progress_array):
+                base_values = np.asarray(base_sampler(progress_array), dtype=float)
+                factors = np.asarray(jitter_function.evaluate_array(progress_array), dtype=float)
+                result = base_values * factors
+                if np.any(~np.isfinite(result)):
+                    result = base_values
+                return result
+
+            return jittered_sampler
+
+        return base_sampler
+
+    def curvature_spacing_sampler(self, progress_array):
+        if self.curvature_progress is None or self.curvature_spacing_profile is None:
+            progress_array = np.asarray(progress_array, dtype=float)
+            return np.full(progress_array.shape, self.default_cone_distance, dtype=float)
+        progress = np.asarray(progress_array, dtype=float)
+        wrapped = np.mod(progress, 1.0)
+        xp = np.asarray(self.curvature_progress, dtype=float)
+        fp = np.asarray(self.curvature_spacing_profile, dtype=float)
+        if xp.size == 0 or fp.size == 0:
+            return np.full_like(progress, self.default_cone_distance, dtype=float)
+        xp = np.concatenate((xp, [1.0]))
+        fp = np.concatenate((fp, [fp[0]]))
+        return np.interp(wrapped, xp, fp)
+
+    def get_curvature_reference(self):
+        if self.curvature_progress is None or self.curvature_values is None:
+            return None
+        return {
+            "progress": self.curvature_progress,
+            "values": self.curvature_values,
+            "label": "Curvature κ (1/m)",
+        }
     
     def activate_add_mode(self):
         self.mode = "add"
@@ -287,22 +633,19 @@ class FSTrackDraw(QMainWindow):
         
     def export_csv(self):
         """Export the cone positions as CSV in meters."""
-        try:
-            cone_spacing = float(self.cone_spacing_entry.text())
-        except ValueError:
-            cone_spacing = self.default_cone_distance
-            
-        if self.centerline is None or self.left_boundary is None or self.right_boundary is None:
+        if (
+            self.centerline is None
+            or self.left_boundary is None
+            or self.right_boundary is None
+            or self.left_cones is None
+            or self.right_cones is None
+        ):
             QMessageBox.critical(self, "Export Error", "No track defined yet!")
             return
             
-        # Convert boundaries to numpy arrays
-        left_boundary = np.array([[p.x(), p.y()] for p in self.left_boundary])
-        right_boundary = np.array([[p.x(), p.y()] for p in self.right_boundary])
-        
-        left_cones = sample_cones(left_boundary, cone_spacing, self.px_per_m)
-        right_cones = sample_cones(right_boundary, cone_spacing, self.px_per_m)
-        
+        left_cones = np.asarray(self.left_cones, dtype=float)
+        right_cones = np.asarray(self.right_cones, dtype=float)
+
         # Define new coordinate system
         origin = np.array([self.centerline[0].x(), self.centerline[0].y()])
         if len(self.centerline) < 2:
@@ -354,41 +697,92 @@ class FSTrackDraw(QMainWindow):
         
         # Update track parameters
         try:
-            self.track_width = float(self.track_width_entry.text())
-        except ValueError:
-            pass
-            
-        try:
             backoff_val = float(self.backoff_entry.text())
         except ValueError:
             backoff_val = self.min_boundary_backoff
         self.min_boundary_backoff = backoff_val
-        
+
+        if self.curvature_analysis_green_segments or self.curvature_analysis_red_segments:
+            self.clear_curvature_analysis("track updated")
+
         # If at least 3 control points, compute and draw track
+        track_ready = False
+        self.centerline_warn_segments = []
+        self.left_boundary_warn_segments = []
+        self.right_boundary_warn_segments = []
         if len(self.control_points) > 3:
-            # Convert QPointF to numpy array for spline calculation
             pts = np.array([[p.x(), p.y()] for p in self.control_points])
-            centerline = create_closed_spline(pts, num_points=self.n_points_midline)
-            self.centerline = [QPointF(p[0], p[1]) for p in centerline]
-            
-            boundaries = generate_offset_boundaries(centerline, self.track_width, 
-                                                    self.px_per_m)
-            if boundaries[0] is None or boundaries[1] is None:
-                return
-                
-            left_boundary, right_boundary = boundaries
-            self.left_boundary = [QPointF(p[0], p[1]) for p in left_boundary]
-            self.right_boundary = [QPointF(p[0], p[1]) for p in right_boundary]
-            
-            # Calculate statistics
-            track_length = self.calculate_track_length()
-            min_radius = self.calculate_min_radius()
-            blue_cones, yellow_cones, total_cones = self.count_cones()
-            
-            # Update the labels with calculated statistics
-            self.track_length_label.setText(f"Track Length: {track_length:.2f} m")
-            self.min_radius_label.setText(f"Min Radius: {min_radius:.2f} m")
-            self.cone_count_label.setText(f"Cones: \n Blue: {blue_cones}, Yellow: {yellow_cones} \n Total: {total_cones}")
+            centerline_np = create_closed_spline(pts, num_points=self.n_points_midline)
+            self.centerline = [QPointF(p[0], p[1]) for p in centerline_np]
+
+            progress, curvature = compute_curvature_profile(centerline_np, self.px_per_m)
+            if progress.size:
+                spacing_profile = self._compute_spacing_profile(curvature)
+                self.curvature_progress = progress
+                self.curvature_values = curvature
+                self.curvature_spacing_profile = spacing_profile
+            else:
+                self.curvature_progress = None
+                self.curvature_values = None
+                self.curvature_spacing_profile = None
+
+            try:
+                boundaries = generate_variable_offset_boundaries(
+                    centerline_np,
+                    self.track_width_function.evaluate_array,
+                    self.px_per_m,
+                )
+            except Exception as exc:
+                boundaries = (None, None)
+                print("Failed to build offset boundaries:", exc)
+
+            if boundaries[0] is not None and boundaries[1] is not None:
+                left_boundary, right_boundary = boundaries
+                self.left_boundary = [QPointF(p[0], p[1]) for p in left_boundary]
+                self.right_boundary = [QPointF(p[0], p[1]) for p in right_boundary]
+
+                spacing_sampler = self.get_spacing_sampler()
+                try:
+                    self.left_cones = sample_cones_variable(
+                        left_boundary, centerline_np, spacing_sampler, self.px_per_m
+                    )
+                except Exception as exc:
+                    print("Failed to sample left cones:", exc)
+                    self.left_cones = None
+                try:
+                    self.right_cones = sample_cones_variable(
+                        right_boundary, centerline_np, spacing_sampler, self.px_per_m
+                    )
+                except Exception as exc:
+                    print("Failed to sample right cones:", exc)
+                    self.right_cones = None
+
+                track_length = self.calculate_track_length()
+                min_radius = self.calculate_min_radius()
+                blue_cones, yellow_cones, total_cones = self.count_cones()
+
+                self.track_length_label.setText(f"Track Length: {track_length:.2f} m")
+                self.min_radius_label.setText(f"Min Radius: {min_radius:.2f} m")
+                self.cone_count_label.setText(
+                    f"Cones: \n Blue: {blue_cones}, Yellow: {yellow_cones} \n Total: {total_cones}"
+                )
+                track_ready = True
+            else:
+                self.left_boundary = None
+                self.right_boundary = None
+
+        if not track_ready:
+            self.centerline = None
+            self.left_boundary = None
+            self.right_boundary = None
+            self.left_cones = None
+            self.right_cones = None
+            self.curvature_progress = None
+            self.curvature_values = None
+            self.curvature_spacing_profile = None
+            self.track_length_label.setText("Track Length: --")
+            self.min_radius_label.setText("Min Radius: --")
+            self.cone_count_label.setText("Cones: \n Blue: -, Yellow: - \n Total: -")
 
         if len(self.barrier_polygon) > 2:
             # Convert barrier polygon to numpy array for spline calculation
@@ -397,16 +791,152 @@ class FSTrackDraw(QMainWindow):
             if self.barrier_offset_polygon is not None:
                 self.barrier_offset_polygon = [QPointF(p[0], p[1]) for p in self.barrier_offset_polygon]
 
-        self.canvas.update_drawing(
-          self.control_points,
-          self.centerline,
-          self.left_boundary,
-          self.right_boundary,
-          self.boundaries_swapped,
-          self.barrier_polygon,
-          self.barrier_offset_polygon,
-        )
+        self._update_canvas()
             
+    def _convert_to_qpoints(self, points):
+        if points is None:
+            return None
+        converted = []
+        for pt in points:
+            if isinstance(pt, QPointF):
+                converted.append(pt)
+            else:
+                converted.append(QPointF(float(pt[0]), float(pt[1])))
+        return converted
+
+    def _convert_segments_to_qpoints(self, segments):
+        converted = []
+        for p0, p1 in segments:
+            x0, y0 = float(p0[0]), float(p0[1])
+            x1, y1 = float(p1[0]), float(p1[1])
+            converted.append((QPointF(x0, y0), QPointF(x1, y1)))
+        return converted
+
+    def clear_curvature_analysis(self, reason: str = None):
+        self.curvature_analysis_green_segments = []
+        self.curvature_analysis_red_segments = []
+        if reason:
+            self.curvature_check_status_label.setText(f"Curvature check: {reason}")
+        else:
+            self.curvature_check_status_label.setText("Curvature check: not run")
+
+    def _sync_curvature_clearance(self):
+        self.curvature_clearance_m = self._parse_positive_line_edit(
+            self.curvature_clearance_entry,
+            self.curvature_clearance_m,
+            minimum=0.05,
+        )
+
+    def _update_canvas(self):
+        self.canvas.update_drawing(
+            self.control_points,
+            self.centerline,
+            self.left_boundary,
+            self.right_boundary,
+            self.boundaries_swapped,
+            self.barrier_polygon,
+            self.barrier_offset_polygon,
+            self._convert_to_qpoints(self.left_cones),
+            self._convert_to_qpoints(self.right_cones),
+            self.centerline_warn_segments,
+            self.left_boundary_warn_segments,
+            self.right_boundary_warn_segments,
+            self._convert_segments_to_qpoints(self.curvature_analysis_green_segments),
+            self._convert_segments_to_qpoints(self.curvature_analysis_red_segments),
+        )
+
+    def _build_curvature_analysis_segments(self, path_px: np.ndarray, curvature: np.ndarray, threshold: float):
+        if path_px is None or curvature is None:
+            return [], []
+        points = np.asarray(path_px, dtype=float)
+        curv = np.asarray(curvature, dtype=float)
+        if points.ndim != 2 or points.shape[0] < 2:
+            return [], []
+        if curv.shape[0] != points.shape[0]:
+            count = min(points.shape[0], curv.shape[0])
+            points = points[:count]
+            curv = curv[:count]
+        if np.allclose(points[0], points[-1]):
+            points = points[:-1]
+            curv = curv[: points.shape[0]]
+        count = points.shape[0]
+        if count < 2:
+            return [], []
+        threshold = abs(threshold)
+        segments_green = []
+        segments_red = []
+        for idx in range(count):
+            nxt = (idx + 1) % count
+            p0 = points[idx]
+            p1 = points[nxt]
+            curv_ok = (abs(curv[idx]) <= threshold) and (abs(curv[nxt]) <= threshold)
+            if curv_ok:
+                segments_green.append((p0, p1))
+            else:
+                segments_red.append((p0, p1))
+        return segments_green, segments_red
+
+    def check_curvature(self):
+        if self.left_boundary is None or self.right_boundary is None:
+            QMessageBox.warning(self, "Curvature Check", "Generate the track before checking curvature.")
+            return
+        left_points = np.array([[pt.x(), pt.y()] for pt in self.left_boundary], dtype=float)
+        right_points = np.array([[pt.x(), pt.y()] for pt in self.right_boundary], dtype=float)
+        if left_points.shape[0] < 3 or right_points.shape[0] < 3:
+            QMessageBox.warning(self, "Curvature Check", "Not enough boundary points to evaluate curvature.")
+            return
+        scale = float(self.px_per_m)
+        left_m = left_points / scale
+        right_m = right_points / scale
+        self._sync_curvature_clearance()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.curvature_check_status_label.setText("Curvature check: computing…")
+        try:
+            x_opt, y_opt, _, _, curvature, _ = optimize_raceline(
+                left_m,
+                right_m,
+                spacing_list=self.curvature_spacing_sequence,
+                dist_weight=1e-5,
+                wall_clearance=self.curvature_clearance_m,
+                use_sparse=True,
+                use_kdtree=True,
+                closed_path=True,
+                debug=False,
+            )
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            self.clear_curvature_analysis("failed")
+            QMessageBox.critical(self, "Curvature Check", f"Failed to compute minimum-curvature path:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        path_px = np.column_stack((x_opt, y_opt)) * scale
+        green_segments, red_segments = self._build_curvature_analysis_segments(
+            path_px, curvature, self.CURVATURE_ALERT_THRESHOLD
+        )
+        self.curvature_analysis_green_segments = green_segments
+        self.curvature_analysis_red_segments = red_segments
+        if red_segments:
+            self.curvature_check_status_label.setText(
+                f"Curvature check: {len(red_segments)} segments below 4.5 m radius"
+            )
+        else:
+            self.curvature_check_status_label.setText(
+                "Curvature check: OK (radius ≥ 4.5 m)"
+            )
+        self._update_canvas()
+
+    def _parse_positive_line_edit(self, entry, current_value, minimum: float = 0.0):
+        text = entry.text().strip()
+        try:
+            value = float(text)
+        except ValueError:
+            value = current_value
+        if value < minimum:
+            value = minimum
+        entry.setText(f"{value:.3f}")
+        return value
+
     def calculate_track_length(self):
         """Calculate the total length of the track (centerline B-spline)."""
         if len(self.centerline) < 2:
@@ -420,55 +950,16 @@ class FSTrackDraw(QMainWindow):
         
     def calculate_min_radius(self):
         """Calculate the minimum radius of curvature of the centerline B-spline."""
-        if len(self.centerline) < 3:
-            return float('inf')  # No valid curvature can be calculated
-            
-        # Extract x and y coordinates from the centerline
-        x_coords = [p.x() for p in self.centerline]
-        y_coords = [p.y() for p in self.centerline]
-        
-        # Parametrize the centerline
-        tck, u = splprep([x_coords, y_coords], s=0, per=True)  # Use per=True for closed splines
-        
-        min_radius = float('inf')
-        
-        # Calculate curvature at each point on the B-spline
-        for t in np.linspace(0, 1, len(self.centerline)):
-            # First derivatives (x', y')
-            dx, dy = splev(t, tck, der=1)
-            
-            # Second derivatives (x'', y'')
-            ddx, ddy = splev(t, tck, der=2)
-            
-            # Curvature formula
-            numerator = abs(dx * ddy - dy * ddx)
-            denominator = (dx**2 + dy**2)**(3/2)
-            
-            if denominator == 0:
-                continue  # Skip if denominator is zero
-                
-            curvature = numerator / denominator
-            radius = 1 / curvature
-            
-            # Track the minimum radius
-            min_radius = min(min_radius, radius)
-            
-        return min_radius / self.px_per_m  # Convert from pixels to meters
+        if self.curvature_values is None or len(self.curvature_values) == 0:
+            return float('inf')
+        with np.errstate(divide='ignore'):
+            radii = np.where(self.curvature_values > 1e-9, 1.0 / self.curvature_values, np.inf)
+        return float(np.min(radii))
         
     def count_cones(self):
         """Count the number of blue, yellow, and total cones."""
-        try:
-            cone_spacing = float(self.cone_spacing_entry.text())
-        except ValueError:
-            cone_spacing = self.default_cone_distance
-            
-        if self.left_boundary is None or self.right_boundary is None:
+        if self.left_cones is None or self.right_cones is None:
             return 0, 0, 0
-            
-        left_boundary = np.array([[p.x(), p.y()] for p in self.left_boundary])
-        right_boundary = np.array([[p.x(), p.y()] for p in self.right_boundary])
-        
-        left_cones = sample_cones(left_boundary, cone_spacing, self.px_per_m)
-        right_cones = sample_cones(right_boundary, cone_spacing, self.px_per_m)
-        
-        return len(left_cones), len(right_cones), len(left_cones) + len(right_cones)
+        blue = len(self.left_cones)
+        yellow = len(self.right_cones)
+        return blue, yellow, blue + yellow

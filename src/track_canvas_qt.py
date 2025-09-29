@@ -2,7 +2,6 @@ import numpy as np
 from PyQt5.QtWidgets import QWidget
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPolygonF
-from utils_qt import sample_cones
 
 
 class TrackCanvas(QWidget):
@@ -34,6 +33,13 @@ class TrackCanvas(QWidget):
         self.left_boundary = None
         self.right_boundary = None
         self.boundaries_swapped = False
+        self.left_cones = None
+        self.right_cones = None
+        self.centerline_alert_segments = []
+        self.left_alert_segments = []
+        self.right_alert_segments = []
+        self.curvature_green_segments = []
+        self.curvature_red_segments = []
 
         self.barrier_polygon = None  # Barrier polygon
         self.barrier_offset_polygon = None  # Offset polygon inside the barrier
@@ -114,7 +120,10 @@ class TrackCanvas(QWidget):
         )
 
     def update_drawing(self, control_points, centerline, left_boundary, right_boundary, 
-                      boundaries_swapped, barrier_polygon, barrier_offset_polygon):
+                      boundaries_swapped, barrier_polygon, barrier_offset_polygon,
+                      left_cones=None, right_cones=None,
+                      centerline_warn_segments=None, left_warn_segments=None, right_warn_segments=None,
+                      curvature_green_segments=None, curvature_red_segments=None):
         """Update the drawing with new data"""
         self.control_points = control_points
         self.centerline = centerline
@@ -123,6 +132,13 @@ class TrackCanvas(QWidget):
         self.boundaries_swapped = boundaries_swapped
         self.barrier_polygon = barrier_polygon
         self.barrier_offset_polygon = barrier_offset_polygon
+        self.left_cones = left_cones
+        self.right_cones = right_cones
+        self.centerline_alert_segments = centerline_warn_segments or []
+        self.left_alert_segments = left_warn_segments or []
+        self.right_alert_segments = right_warn_segments or []
+        self.curvature_green_segments = curvature_green_segments or []
+        self.curvature_red_segments = curvature_red_segments or []
         self.update()
         
     def paintEvent(self, event):
@@ -174,6 +190,15 @@ class TrackCanvas(QWidget):
             for i in range(1, len(display_points)):
                 painter.drawLine(display_points[i-1], display_points[i])
 
+            if self.centerline_alert_segments:
+                alert_pen = QPen(QColor(255, 0, 0), 3)
+                alert_pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(alert_pen)
+                for p0, p1 in self.centerline_alert_segments:
+                    pt0 = QPointF(*self.transform_point(p0[0], p0[1]))
+                    pt1 = QPointF(*self.transform_point(p1[0], p1[1]))
+                    painter.drawLine(pt0, pt1)
+
         # Draw boundaries (transform from map to display coords)
         if self.left_boundary and len(self.left_boundary) > 1:
             painter.setPen(QPen(self.left_color, 2))
@@ -188,6 +213,16 @@ class TrackCanvas(QWidget):
             
             painter.drawPolyline(QPolygonF(display_points))
 
+            if self.left_alert_segments:
+                alert_pen = QPen(QColor(255, 0, 0), 3)
+                alert_pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(alert_pen)
+                for p0, p1 in self.left_alert_segments:
+                    painter.drawLine(
+                        QPointF(*self.transform_point(p0[0], p0[1])),
+                        QPointF(*self.transform_point(p1[0], p1[1]))
+                    )
+
         if self.right_boundary and len(self.right_boundary) > 1:
             painter.setPen(QPen(self.right_color, 2))
             
@@ -201,44 +236,56 @@ class TrackCanvas(QWidget):
             
             painter.drawPolyline(QPolygonF(display_points))
 
-        # Draw cones (transform from map to display coords)
-        try:
-            cone_spacing = float(self.parent.cone_spacing_entry.text())
-        except ValueError:
-            cone_spacing = self.parent.default_cone_distance
+            if self.right_alert_segments:
+                alert_pen = QPen(QColor(255, 0, 0), 3)
+                alert_pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(alert_pen)
+                for p0, p1 in self.right_alert_segments:
+                    painter.drawLine(
+                        QPointF(*self.transform_point(p0[0], p0[1])),
+                        QPointF(*self.transform_point(p1[0], p1[1]))
+                    )
 
-        if self.left_boundary and len(self.left_boundary) > 1:
-            # Get boundary points in map coordinates
-            boundary_points = []
-            for pt in self.left_boundary:
-                if isinstance(pt, QPointF):
-                    boundary_points.append([pt.x(), pt.y()])
-                else:
-                    boundary_points.append([pt[0], pt[1]])
-            
-            left_cones = sample_cones(np.array(boundary_points), cone_spacing, self.parent.px_per_m)
-            
+        # Draw curvature analysis path segments
+        if self.curvature_green_segments:
+            pen_green = QPen(QColor(0, 100, 0), 3)
+            pen_green.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen_green)
+            for p0, p1 in self.curvature_green_segments:
+                painter.drawLine(
+                    QPointF(*self.transform_point(p0.x(), p0.y())),
+                    QPointF(*self.transform_point(p1.x(), p1.y()))
+                )
+
+        if self.curvature_red_segments:
+            pen_red = QPen(QColor(220, 0, 0), 3)
+            pen_red.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen_red)
+            for p0, p1 in self.curvature_red_segments:
+                painter.drawLine(
+                    QPointF(*self.transform_point(p0.x(), p0.y())),
+                    QPointF(*self.transform_point(p1.x(), p1.y()))
+                )
+
+
+        # Draw cones with precomputed positions
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        if self.left_cones is not None:
             painter.setBrush(self.left_color)
-            painter.setPen(QPen(QColor(0, 0, 0), 1))
-            for pt in left_cones:
-                display_pt = QPointF(*self.transform_point(pt[0], pt[1]))
-                painter.drawEllipse(display_pt, 3, 3)
-                
-        if self.right_boundary and len(self.right_boundary) > 1:
-            # Get boundary points in map coordinates
-            boundary_points = []
-            for pt in self.right_boundary:
+            for pt in self.left_cones:
                 if isinstance(pt, QPointF):
-                    boundary_points.append([pt.x(), pt.y()])
+                    display_pt = QPointF(*self.transform_point(pt.x(), pt.y()))
                 else:
-                    boundary_points.append([pt[0], pt[1]])
-            
-            right_cones = sample_cones(np.array(boundary_points), cone_spacing, self.parent.px_per_m)
-            
+                    display_pt = QPointF(*self.transform_point(pt[0], pt[1]))
+                painter.drawEllipse(display_pt, 3, 3)
+
+        if self.right_cones is not None:
             painter.setBrush(self.right_color)
-            painter.setPen(QPen(QColor(0, 0, 0), 1))
-            for pt in right_cones:
-                display_pt = QPointF(*self.transform_point(pt[0], pt[1]))
+            for pt in self.right_cones:
+                if isinstance(pt, QPointF):
+                    display_pt = QPointF(*self.transform_point(pt.x(), pt.y()))
+                else:
+                    display_pt = QPointF(*self.transform_point(pt[0], pt[1]))
                 painter.drawEllipse(display_pt, 3, 3)
 
         # Draw barriers (transform from map to display coords)
