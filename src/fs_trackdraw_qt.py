@@ -2,8 +2,22 @@ import os
 import math
 import csv
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                            QPushButton, QLineEdit, QFileDialog, QMessageBox, QCheckBox, QSizePolicy)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QLineEdit,
+    QFileDialog,
+    QMessageBox,
+    QCheckBox,
+    QSizePolicy,
+    QToolButton,
+    QButtonGroup,
+)
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPixmap
 import yaml
@@ -72,6 +86,22 @@ class FSTrackDraw(QMainWindow):
             sat_img_file = config.get('sat_img_path', '')
             self.fpath_location_sat_img = os.path.join(self.folderpath_location, sat_img_file)
         
+        # Editor state variables
+        self.editor_mode = "control"  # "control" or "cone"
+        self.mode = "add"  # Track submode: "add", "remove", "move"
+        self.cone_mode = "move"  # Cone submode: "add", "move", "remove"
+        self.selected_point_index = None
+        self.selected_cone_side = None
+        self.selected_cone_index = None
+        self.dragging = False
+        self.cone_dragging = False
+        self.dragging_barrier = False
+        self.barrier_mode = "add"  # Default mode is adding barrier points
+        self.cone_edits_dirty = False
+
+        self.track_editor_widgets = []
+        self.cone_editor_widgets = []
+
         # Create main widget and layout
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
@@ -93,34 +123,99 @@ class FSTrackDraw(QMainWindow):
         self.ui_layout.setAlignment(Qt.AlignTop)
         self.main_layout.addWidget(self.ui_frame)
         
+        # Editor mode selector
+        selector_container = QWidget()
+        selector_layout = QHBoxLayout(selector_container)
+        selector_layout.setContentsMargins(0, 0, 0, 0)
+        selector_layout.setSpacing(6)
+
+        self.editor_button_group = QButtonGroup(self)
+        self.editor_button_group.setExclusive(True)
+
+        self.track_editor_button = QPushButton("Track Editor")
+        self.track_editor_button.setCheckable(True)
+        self.track_editor_button.setChecked(True)
+        self.track_editor_button.clicked.connect(lambda: self.set_editor_mode("control"))
+        selector_layout.addWidget(self.track_editor_button, 1)
+        self.editor_button_group.addButton(self.track_editor_button)
+
+        self.cone_editor_button = QPushButton("Cone Editor")
+        self.cone_editor_button.setCheckable(True)
+        self.cone_editor_button.setChecked(False)
+        self.cone_editor_button.clicked.connect(lambda: self.set_editor_mode("cone"))
+        selector_layout.addWidget(self.cone_editor_button, 1)
+        self.editor_button_group.addButton(self.cone_editor_button)
+
+        self.ui_layout.addWidget(selector_container)
+
         # Mode label
         self.mode_label = QLabel("Track Mode: Add")
         self.mode_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         self.ui_layout.addWidget(self.mode_label)
-        
+
         # Mode buttons
         self.add_button = QPushButton("Add Control Point")
         self.add_button.clicked.connect(self.activate_add_mode)
         self.ui_layout.addWidget(self.add_button)
-        
+        self.track_editor_widgets.append(self.add_button)
+
         self.remove_button = QPushButton("Remove Control Point")
         self.remove_button.clicked.connect(self.activate_remove_mode)
         self.ui_layout.addWidget(self.remove_button)
-        
+        self.track_editor_widgets.append(self.remove_button)
+
         self.move_button = QPushButton("Move Control Point")
         self.move_button.clicked.connect(self.activate_move_mode)
         self.ui_layout.addWidget(self.move_button)
+        self.track_editor_widgets.append(self.move_button)
+
+        # Cone mode buttons (disabled until cone editor active)
+        cone_info_layout = QHBoxLayout()
+        cone_info_layout.setContentsMargins(0, 0, 0, 0)
+        cone_info_layout.setSpacing(4)
+
+        self.add_cone_button = QPushButton("Add Cone")
+        self.add_cone_button.clicked.connect(self.activate_cone_add_mode)
+        cone_info_layout.addWidget(self.add_cone_button)
+
+        self.cone_add_info_button = QToolButton()
+        self.cone_add_info_button.setText("?")
+        self.cone_add_info_button.setToolTip(
+            "Cone Add mode: click an existing cone to insert a new cone halfway to the next cone in order."
+        )
+        self.cone_add_info_button.clicked.connect(self.show_add_cone_info)
+        cone_info_layout.addWidget(self.cone_add_info_button)
+
+        cone_add_container = QWidget()
+        cone_add_container.setLayout(cone_info_layout)
+        self.ui_layout.addWidget(cone_add_container)
+        self.cone_editor_widgets.extend([cone_add_container, self.add_cone_button, self.cone_add_info_button])
+
+        self.move_cone_button = QPushButton("Move Cone")
+        self.move_cone_button.clicked.connect(self.activate_cone_move_mode)
+        self.ui_layout.addWidget(self.move_cone_button)
+        self.cone_editor_widgets.append(self.move_cone_button)
+
+        self.remove_cone_button = QPushButton("Remove Cone")
+        self.remove_cone_button.clicked.connect(self.activate_cone_remove_mode)
+        self.ui_layout.addWidget(self.remove_cone_button)
+        self.cone_editor_widgets.append(self.remove_cone_button)
+
+        for widget in self.cone_editor_widgets:
+            widget.setEnabled(False)
 
         self.ui_layout.addWidget(QLabel("Control point random nudge (m):"))
         self.control_point_nudge_entry = QLineEdit(f"{self.control_point_nudge_amount_m:.3f}")
         self.control_point_nudge_entry.setToolTip("Maximum absolute displacement applied per control point when randomizing")
         self.control_point_nudge_entry.editingFinished.connect(self.update_control_point_nudge_amount)
         self.ui_layout.addWidget(self.control_point_nudge_entry)
+        self.track_editor_widgets.append(self.control_point_nudge_entry)
 
         self.randomize_control_points_button = QPushButton("Randomize Control Points")
         self.randomize_control_points_button.setToolTip("Apply random jitters to the current control points within the specified distance")
         self.randomize_control_points_button.clicked.connect(self.randomize_control_points)
         self.ui_layout.addWidget(self.randomize_control_points_button)
+        self.track_editor_widgets.append(self.randomize_control_points_button)
 
         self.control_point_random_status_label = QLabel("Control point randomization: not applied")
         self.ui_layout.addWidget(self.control_point_random_status_label)
@@ -140,19 +235,23 @@ class FSTrackDraw(QMainWindow):
         self.cone_spacing_entry = QLineEdit(str(self.default_cone_distance))
         self.cone_spacing_entry.returnPressed.connect(self.update_cone_spacing_constant)
         self.ui_layout.addWidget(self.cone_spacing_entry)
+        self.track_editor_widgets.append(self.cone_spacing_entry)
 
         self.edit_cone_spacing_button = QPushButton("Edit Cone Spacing Function")
         self.edit_cone_spacing_button.clicked.connect(self.open_cone_spacing_editor)
         self.ui_layout.addWidget(self.edit_cone_spacing_button)
+        self.track_editor_widgets.append(self.edit_cone_spacing_button)
 
         self.auto_spacing_checkbox = QCheckBox("Auto spacing from curvature")
         self.auto_spacing_checkbox.stateChanged.connect(self.toggle_auto_spacing)
         self.ui_layout.addWidget(self.auto_spacing_checkbox)
+        self.track_editor_widgets.append(self.auto_spacing_checkbox)
 
         self.cone_spacing_random_checkbox = QCheckBox("Enable cone spacing randomness")
         self.cone_spacing_random_checkbox.stateChanged.connect(self.toggle_cone_spacing_randomness)
         self.cone_spacing_random_checkbox.setToolTip("Apply random variation to cone spacing values when enabled")
         self.ui_layout.addWidget(self.cone_spacing_random_checkbox)
+        self.track_editor_widgets.append(self.cone_spacing_random_checkbox)
 
         self.ui_layout.addWidget(QLabel("Cone spacing randomness amount"))
         self.cone_spacing_random_amount_entry = QLineEdit(f"{self.cone_spacing_jitter_amount:.3f}")
@@ -160,15 +259,18 @@ class FSTrackDraw(QMainWindow):
         self.cone_spacing_random_amount_entry.editingFinished.connect(self.update_cone_spacing_jitter_amount)
         self.cone_spacing_random_amount_entry.setEnabled(False)
         self.ui_layout.addWidget(self.cone_spacing_random_amount_entry)
+        self.track_editor_widgets.append(self.cone_spacing_random_amount_entry)
 
         self.randomize_cone_spacing_button = QPushButton("Randomize Cone Spacing")
         self.randomize_cone_spacing_button.setToolTip("Generate a new random cone spacing profile using the jitter amount")
         self.randomize_cone_spacing_button.clicked.connect(lambda: self.randomize_cone_spacing_profile())
         self.randomize_cone_spacing_button.setEnabled(False)
         self.ui_layout.addWidget(self.randomize_cone_spacing_button)
+        self.track_editor_widgets.append(self.randomize_cone_spacing_button)
 
         self.cone_spacing_random_status_label = QLabel("Cone spacing randomness: disabled")
         self.ui_layout.addWidget(self.cone_spacing_random_status_label)
+        self.track_editor_widgets.append(self.cone_spacing_random_status_label)
 
         self.check_curvature_button = QPushButton("Check Curvature")
         self.check_curvature_button.setToolTip(
@@ -192,10 +294,12 @@ class FSTrackDraw(QMainWindow):
         self.track_width_entry = QLineEdit(str(self.track_width))
         self.track_width_entry.returnPressed.connect(self.update_track_width_constant)
         self.ui_layout.addWidget(self.track_width_entry)
+        self.track_editor_widgets.append(self.track_width_entry)
 
         self.edit_track_width_button = QPushButton("Edit Track Width Function")
         self.edit_track_width_button.clicked.connect(self.open_track_width_editor)
         self.ui_layout.addWidget(self.edit_track_width_button)
+        self.track_editor_widgets.append(self.edit_track_width_button)
 
         self._update_auto_spacing_tooltip()
 
@@ -203,35 +307,45 @@ class FSTrackDraw(QMainWindow):
         self.barrier_mode_label = QLabel("Barrier Mode: Add")
         self.barrier_mode_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         self.ui_layout.addWidget(self.barrier_mode_label)
+        self.track_editor_widgets.append(self.barrier_mode_label)
 
         # Add barrier mode buttons
         self.add_barrier_button = QPushButton("Add Barrier Point")
         self.add_barrier_button.clicked.connect(self.activate_add_barrier_mode)
         self.ui_layout.addWidget(self.add_barrier_button)
+        self.track_editor_widgets.append(self.add_barrier_button)
 
         self.move_barrier_button = QPushButton("Move Barrier Point")
         self.move_barrier_button.clicked.connect(self.activate_move_barrier_mode)
         self.ui_layout.addWidget(self.move_barrier_button)
+        self.track_editor_widgets.append(self.move_barrier_button)
 
         self.remove_barrier_button = QPushButton("Remove Barrier Point")
         self.remove_barrier_button.clicked.connect(self.activate_remove_barrier_mode)
         self.ui_layout.addWidget(self.remove_barrier_button)
+        self.track_editor_widgets.append(self.remove_barrier_button)
 
         # Swap barrier offset button
         self.swap_barrier_button = QPushButton("Swap Barrier Offset")
         self.swap_barrier_button.clicked.connect(self.swap_barrier_offset)
         self.ui_layout.addWidget(self.swap_barrier_button)
+        self.track_editor_widgets.append(self.swap_barrier_button)
 
         # Backoff input
         self.ui_layout.addWidget(QLabel("Backoff (m):"))
         self.backoff_entry = QLineEdit(str(self.min_boundary_backoff))
         self.backoff_entry.returnPressed.connect(self.redraw)
         self.ui_layout.addWidget(self.backoff_entry)
+        self.track_editor_widgets.append(self.backoff_entry)
 
         # Add label that explains to use right click for barrier points
-        self.ui_layout.addWidget(QLabel("Right Click: Barrier Points"))
+        self.right_click_label = QLabel("Right Click: Barrier Points")
+        self.ui_layout.addWidget(self.right_click_label)
+        self.track_editor_widgets.append(self.right_click_label)
         # Add label that explains to use left click for track control points
-        self.ui_layout.addWidget(QLabel("Left Click: Track Control Points"))
+        self.left_click_label = QLabel("Left Click: Track Control Points")
+        self.ui_layout.addWidget(self.left_click_label)
+        self.track_editor_widgets.append(self.left_click_label)
 
         # Statistics labels
         self.track_length_label = QLabel("Track Length: --")
@@ -265,13 +379,8 @@ class FSTrackDraw(QMainWindow):
         self.barrier_offset_swapped = False
         self.perform_swap = False
         self.perform_barrier_swap = False
-        
-        # GUI control variables
-        self.mode = "add"  # Modes: "add", "remove", "move"
-        self.selected_point_index = None
-        self.dragging = False
-        self.dragging_barrier = False
-        self.barrier_mode = "add"  # Default mode is adding barrier points
+
+        self.set_editor_mode("control")
 
         # Add logo at the bottom right
         self.logo_label = QLabel()
@@ -538,17 +647,117 @@ class FSTrackDraw(QMainWindow):
             "label": "Curvature κ (1/m)",
         }
     
+    def update_mode_label(self):
+        if self.editor_mode == "control":
+            mode_names = {"add": "Add", "remove": "Remove", "move": "Move"}
+            label = mode_names.get(self.mode, self.mode.title())
+            self.mode_label.setText(f"Track Mode: {label}")
+        else:
+            mode_names = {"add": "Add", "remove": "Remove", "move": "Move"}
+            label = mode_names.get(self.cone_mode, self.cone_mode.title())
+            self.mode_label.setText(f"Cone Mode: {label}")
+
     def activate_add_mode(self):
+        if self.editor_mode != "control":
+            self.set_editor_mode("control")
         self.mode = "add"
-        self.mode_label.setText("Mode: Add")
+        self.update_mode_label()
         
     def activate_remove_mode(self):
+        if self.editor_mode != "control":
+            self.set_editor_mode("control")
         self.mode = "remove"
-        self.mode_label.setText("Mode: Remove")
+        self.update_mode_label()
         
     def activate_move_mode(self):
+        if self.editor_mode != "control":
+            self.set_editor_mode("control")
         self.mode = "move"
-        self.mode_label.setText("Mode: Move")
+        self.update_mode_label()
+
+    def activate_cone_add_mode(self):
+        if self.editor_mode != "cone":
+            self.set_editor_mode("cone")
+        self.cone_mode = "add"
+        self.update_mode_label()
+
+    def activate_cone_move_mode(self):
+        if self.editor_mode != "cone":
+            self.set_editor_mode("cone")
+        self.cone_mode = "move"
+        self.update_mode_label()
+
+    def activate_cone_remove_mode(self):
+        if self.editor_mode != "cone":
+            self.set_editor_mode("cone")
+        self.cone_mode = "remove"
+        self.update_mode_label()
+
+    def set_editor_mode(self, mode: str):
+        mode = "cone" if mode == "cone" else "control"
+        if self.editor_mode == "cone" and mode == "control":
+            message = (
+                "Switching back to the Track Editor will regenerate boundaries and cones,"
+                " discarding cone edits made in Cone Editor mode."
+            )
+            if self.cone_edits_dirty:
+                result = QMessageBox.question(
+                    self,
+                    "Leave Cone Editor",
+                    message + "\n\nProceed?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if result != QMessageBox.Yes:
+                    self.cone_editor_button.setChecked(True)
+                    self.track_editor_button.setChecked(False)
+                    return
+            else:
+                QMessageBox.information(self, "Leave Cone Editor", message)
+            self.cone_edits_dirty = False
+
+        self.editor_mode = mode
+
+        self.track_editor_button.setChecked(mode == "control")
+        self.cone_editor_button.setChecked(mode == "cone")
+
+        for widget in self.track_editor_widgets:
+            if mode == "cone":
+                widget._track_prev_enabled = widget.isEnabled()
+                widget.setEnabled(False)
+            else:
+                prev_enabled = getattr(widget, "_track_prev_enabled", widget.isEnabled())
+                widget.setEnabled(prev_enabled)
+
+        for widget in self.cone_editor_widgets:
+            widget.setEnabled(mode == "cone")
+
+        if mode == "cone":
+            if self.cone_mode not in {"add", "move", "remove"}:
+                self.cone_mode = "move"
+            self.dragging = False
+            self.selected_point_index = None
+        else:
+            if self.mode not in {"add", "remove", "move"}:
+                self.mode = "add"
+            self.cone_dragging = False
+            self.selected_cone_side = None
+            self.selected_cone_index = None
+
+        self.update_mode_label()
+        self.canvas.set_editor_mode(mode)
+        self._update_canvas()
+
+    def show_add_cone_info(self):
+        QMessageBox.information(
+            self,
+            "Adding Cones",
+            (
+                "In Add Cone mode, click an existing cone. A new cone will be inserted"
+                " midway between the selected cone and the next cone in that"
+                " direction, preserving ordering."
+            ),
+        )
 
     def activate_add_barrier_mode(self):
         self.barrier_mode = "add"
@@ -564,8 +773,18 @@ class FSTrackDraw(QMainWindow):
         
     def swap_boundaries(self):
         self.boundaries_swapped = not self.boundaries_swapped
-        self.perform_swap = True
-        self.redraw()
+        if (
+            self.editor_mode == "cone"
+            and self.left_cones is not None
+            and self.right_cones is not None
+        ):
+            self.left_cones, self.right_cones = self.right_cones, self.left_cones
+            if self.left_boundary is not None and self.right_boundary is not None:
+                self.left_boundary, self.right_boundary = self.right_boundary, self.left_boundary
+            self._after_cone_edit(update_counts=True)
+        else:
+            self.perform_swap = True
+            self.redraw()
 
     def swap_barrier_offset(self):
         self.barrier_offset_swapped = not self.barrier_offset_swapped
@@ -590,8 +809,11 @@ class FSTrackDraw(QMainWindow):
         
     def handle_canvas_click(self, pos):
         x, y = pos.x(), pos.y()
+        if self.editor_mode == "cone":
+            self._handle_cone_click(x, y)
+            return
+
         if self.mode == "add":
-            # self.control_points.append(QPointF(x, y))
             self.control_points.insert(0, QPointF(x, y))
             self.redraw()
         elif self.mode == "remove":
@@ -606,9 +828,21 @@ class FSTrackDraw(QMainWindow):
                 self.dragging = True
 
     def handle_canvas_drag(self, pos):
-        if self.dragging and self.selected_point_index is not None and self.mode == "move":
+        if (
+            self.editor_mode == "control"
+            and self.dragging
+            and self.selected_point_index is not None
+            and self.mode == "move"
+        ):
             self.control_points[self.selected_point_index] = QPointF(pos.x(), pos.y())
             self.redraw()
+        elif (
+            self.editor_mode == "cone"
+            and self.cone_dragging
+            and self.selected_cone_side is not None
+            and self.selected_cone_index is not None
+        ):
+            self._handle_cone_drag(pos.x(), pos.y())
         elif self.dragging_barrier and self.selected_point_index is not None and self.barrier_mode == "move":
             self.barrier_polygon[self.selected_point_index] = QPointF(pos.x(), pos.y())
             self.redraw()
@@ -617,13 +851,31 @@ class FSTrackDraw(QMainWindow):
         self.dragging = False
         self.dragging_barrier = False
         self.selected_point_index = None
-        
+        if self.cone_dragging:
+            self._handle_cone_release()
+
     def find_near_control_point(self, x, y, threshold=10):
         for i, pt in enumerate(self.control_points):
             if (pt.x() - x) ** 2 + (pt.y() - y) ** 2 < threshold ** 2:
                 return i
         return None
     
+    def find_near_cone(self, x, y, threshold=15):
+        best = None
+        threshold_sq = threshold ** 2
+        target = np.array([x, y], dtype=float)
+        for side, cones in (("left", self.left_cones), ("right", self.right_cones)):
+            arr = self._ensure_cone_array(cones)
+            if arr.size == 0:
+                continue
+            diffs = arr - target
+            dists_sq = np.einsum("ij,ij->i", diffs, diffs)
+            idx = int(np.argmin(dists_sq))
+            dist_sq = float(dists_sq[idx])
+            if dist_sq <= threshold_sq and (best is None or dist_sq < best[2]):
+                best = (side, idx, dist_sq)
+        return best
+
     def find_near_barrier_point(self, x, y, threshold=10):
         if self.barrier_polygon is not None:
             for i, pt in enumerate(self.barrier_polygon):
@@ -631,6 +883,99 @@ class FSTrackDraw(QMainWindow):
                     return i
         return None
         
+    def _handle_cone_click(self, x: float, y: float):
+        selection = self.find_near_cone(x, y, threshold=20)
+        if selection is None:
+            return
+        side, idx, _ = selection
+
+        if self.cone_mode == "add":
+            arr = self._ensure_cone_array(self.left_cones if side == "left" else self.right_cones)
+            if arr.shape[0] < 2:
+                return
+            next_idx = (idx + 1) % arr.shape[0]
+            midpoint = 0.5 * (arr[idx] + arr[next_idx])
+            arr = np.insert(arr, next_idx, midpoint, axis=0)
+            if side == "left":
+                self.left_cones = arr
+            else:
+                self.right_cones = arr
+            self.clear_curvature_analysis("cones updated")
+            self._after_cone_edit(update_counts=True)
+        elif self.cone_mode == "remove":
+            arr = self._ensure_cone_array(self.left_cones if side == "left" else self.right_cones)
+            if arr.shape[0] == 0:
+                return
+            arr = np.delete(arr, idx, axis=0)
+            if side == "left":
+                self.left_cones = arr
+            else:
+                self.right_cones = arr
+            self.clear_curvature_analysis("cones updated")
+            self._after_cone_edit(update_counts=True)
+        else:  # move mode
+            self.selected_cone_side = side
+            self.selected_cone_index = idx
+            self.cone_dragging = True
+            self.clear_curvature_analysis("cones updated")
+
+    def _handle_cone_drag(self, x: float, y: float):
+        if not self.cone_dragging or self.selected_cone_side is None or self.selected_cone_index is None:
+            return
+        side = self.selected_cone_side
+        arr = self._ensure_cone_array(self.left_cones if side == "left" else self.right_cones)
+        if arr.shape[0] == 0 or self.selected_cone_index >= arr.shape[0]:
+            return
+        arr[self.selected_cone_index] = np.array([x, y], dtype=float)
+        if side == "left":
+            self.left_cones = arr
+        else:
+            self.right_cones = arr
+        self._after_cone_edit(update_counts=False, clear_curvature=False, mark_dirty=False)
+        self.cone_edits_dirty = True
+
+    def _handle_cone_release(self):
+        self.cone_dragging = False
+        self.selected_cone_side = None
+        self.selected_cone_index = None
+        self._after_cone_edit(update_counts=False, clear_curvature=False, mark_dirty=False)
+
+    def _after_cone_edit(
+        self,
+        update_counts: bool = True,
+        clear_curvature: bool = True,
+        mark_dirty: bool = True,
+    ):
+        self.left_cones = self._ensure_cone_array(self.left_cones)
+        self.right_cones = self._ensure_cone_array(self.right_cones)
+        self._update_canvas()
+        if update_counts:
+            self._update_cone_count_label()
+        if clear_curvature and (
+            self.curvature_analysis_green_segments or self.curvature_analysis_red_segments
+        ):
+            self.clear_curvature_analysis("cones updated")
+        if mark_dirty:
+            self.cone_edits_dirty = True
+
+    def _update_cone_count_label(self):
+        if self.left_cones is None or self.right_cones is None:
+            self.cone_count_label.setText("Cones: \n Blue: -, Yellow: - \n Total: -")
+            return
+        blue, yellow, total = self.count_cones()
+        self.cone_count_label.setText(
+            f"Cones: \n Blue: {blue}, Yellow: {yellow} \n Total: {total}"
+        )
+
+    @staticmethod
+    def _ensure_cone_array(values):
+        if values is None:
+            return np.empty((0, 2), dtype=float)
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return np.empty((0, 2), dtype=float)
+        return arr.reshape(-1, 2)
+
     def export_csv(self):
         """Export the cone positions as CSV in meters."""
         if (
@@ -766,11 +1111,12 @@ class FSTrackDraw(QMainWindow):
                 self.cone_count_label.setText(
                     f"Cones: \n Blue: {blue_cones}, Yellow: {yellow_cones} \n Total: {total_cones}"
                 )
+                self.cone_edits_dirty = False
                 track_ready = True
             else:
                 self.left_boundary = None
                 self.right_boundary = None
-
+                
         if not track_ready:
             self.centerline = None
             self.left_boundary = None
@@ -783,6 +1129,7 @@ class FSTrackDraw(QMainWindow):
             self.track_length_label.setText("Track Length: --")
             self.min_radius_label.setText("Min Radius: --")
             self.cone_count_label.setText("Cones: \n Blue: -, Yellow: - \n Total: -")
+            self.cone_edits_dirty = False
 
         if len(self.barrier_polygon) > 2:
             # Convert barrier polygon to numpy array for spline calculation
@@ -843,6 +1190,7 @@ class FSTrackDraw(QMainWindow):
             self.right_boundary_warn_segments,
             self._convert_segments_to_qpoints(self.curvature_analysis_green_segments),
             self._convert_segments_to_qpoints(self.curvature_analysis_red_segments),
+            editor_mode=self.editor_mode,
         )
 
     def _build_curvature_analysis_segments(self, path_px: np.ndarray, curvature: np.ndarray, threshold: float):
@@ -877,13 +1225,16 @@ class FSTrackDraw(QMainWindow):
         return segments_green, segments_red
 
     def check_curvature(self):
-        if self.left_boundary is None or self.right_boundary is None:
-            QMessageBox.warning(self, "Curvature Check", "Generate the track before checking curvature.")
+        if self.left_cones is None or self.right_cones is None:
+            QMessageBox.warning(self, "Curvature Check", "Generate the cones before checking curvature.")
             return
-        left_points = np.array([[pt.x(), pt.y()] for pt in self.left_boundary], dtype=float)
-        right_points = np.array([[pt.x(), pt.y()] for pt in self.right_boundary], dtype=float)
+        left_points = np.asarray(self.left_cones, dtype=float)
+        right_points = np.asarray(self.right_cones, dtype=float)
+        if left_points.ndim != 2 or right_points.ndim != 2 or left_points.shape[1] != 2 or right_points.shape[1] != 2:
+            QMessageBox.warning(self, "Curvature Check", "Cone arrays are malformed; cannot evaluate curvature.")
+            return
         if left_points.shape[0] < 3 or right_points.shape[0] < 3:
-            QMessageBox.warning(self, "Curvature Check", "Not enough boundary points to evaluate curvature.")
+            QMessageBox.warning(self, "Curvature Check", "Not enough cones to evaluate curvature.")
             return
         scale = float(self.px_per_m)
         left_m = left_points / scale

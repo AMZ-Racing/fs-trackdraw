@@ -446,13 +446,12 @@ if __name__ == "__main__":
     wall_left = walls["blue"]
     wall_right = walls["yellow"]
 
-    x_opt, y_opt, wL, wR, curv, s = optimize_raceline_with_constraints(
+    x_opt, y_opt, wL, wR, curv, s = optimize_raceline(
         wall_left,
         wall_right,
         spacing_list=[1.5, 1.0, 0.5],  # Number of iterations will be 3
         dist_weight=1e-5,
         wall_clearance=1.0,
-        kappa_max=1/3.0,
         use_sparse=True,
         use_kdtree=True,
         closed_path=True,

@@ -40,6 +40,7 @@ class TrackCanvas(QWidget):
         self.right_alert_segments = []
         self.curvature_green_segments = []
         self.curvature_red_segments = []
+        self.editor_mode = "control"
 
         self.barrier_polygon = None  # Barrier polygon
         self.barrier_offset_polygon = None  # Offset polygon inside the barrier
@@ -123,7 +124,8 @@ class TrackCanvas(QWidget):
                       boundaries_swapped, barrier_polygon, barrier_offset_polygon,
                       left_cones=None, right_cones=None,
                       centerline_warn_segments=None, left_warn_segments=None, right_warn_segments=None,
-                      curvature_green_segments=None, curvature_red_segments=None):
+                      curvature_green_segments=None, curvature_red_segments=None,
+                      editor_mode: str = "control"):
         """Update the drawing with new data"""
         self.control_points = control_points
         self.centerline = centerline
@@ -139,7 +141,14 @@ class TrackCanvas(QWidget):
         self.right_alert_segments = right_warn_segments or []
         self.curvature_green_segments = curvature_green_segments or []
         self.curvature_red_segments = curvature_red_segments or []
+        self.editor_mode = "cone" if editor_mode == "cone" else "control"
         self.update()
+
+    def set_editor_mode(self, mode: str):
+        mode = "cone" if mode == "cone" else "control"
+        if self.editor_mode != mode:
+            self.editor_mode = mode
+            self.update()
         
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -160,24 +169,27 @@ class TrackCanvas(QWidget):
         self.map_scale_x = scaled_pixmap.width() / self.sat_image.width()
         self.map_scale_y = scaled_pixmap.height() / self.sat_image.height()
         
+        show_track_geometry = self.editor_mode == "control"
+
         # Draw control points (in display coordinates)
-        for i, pt in enumerate(self.control_points):
-            display_pt = QPointF(*self.transform_point(pt.x(), pt.y()))
-            if i == 0 and len(self.control_points) > 2:
-                painter.setBrush(QColor(255, 0, 0))  # Red for first point
-            elif i == len(self.control_points) - 1 and len(self.control_points) > 2:
-                painter.setBrush(QColor(0, 0, 255))  # Blue for last point
-            else:
-                painter.setBrush(QColor(0, 255, 0))  # Green for others
-            painter.setPen(QPen(QColor(0, 0, 0), 1))
-            painter.drawEllipse(display_pt, 5, 5)
+        if show_track_geometry:
+            for i, pt in enumerate(self.control_points):
+                display_pt = QPointF(*self.transform_point(pt.x(), pt.y()))
+                if i == 0 and len(self.control_points) > 2:
+                    painter.setBrush(QColor(255, 0, 0))  # Red for first point
+                elif i == len(self.control_points) - 1 and len(self.control_points) > 2:
+                    painter.setBrush(QColor(0, 0, 255))  # Blue for last point
+                else:
+                    painter.setBrush(QColor(0, 255, 0))  # Green for others
+                painter.setPen(QPen(QColor(0, 0, 0), 1))
+                painter.drawEllipse(display_pt, 5, 5)
 
         # Draw centerline (transform from map to display coords)
-        if self.centerline and len(self.centerline) > 1:
+        if show_track_geometry and self.centerline and len(self.centerline) > 1:
             pen = QPen(QColor(0, 255, 0), 2)
             pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            
+
             # Convert all centerline points to display coordinates
             display_points = []
             for pt in self.centerline:
@@ -185,7 +197,7 @@ class TrackCanvas(QWidget):
                     display_points.append(QPointF(*self.transform_point(pt.x(), pt.y())))
                 else:  # Assume raw coordinates
                     display_points.append(QPointF(*self.transform_point(pt[0], pt[1])))
-            
+
             # Draw connected lines
             for i in range(1, len(display_points)):
                 painter.drawLine(display_points[i-1], display_points[i])
@@ -200,7 +212,7 @@ class TrackCanvas(QWidget):
                     painter.drawLine(pt0, pt1)
 
         # Draw boundaries (transform from map to display coords)
-        if self.left_boundary and len(self.left_boundary) > 1:
+        if show_track_geometry and self.left_boundary and len(self.left_boundary) > 1:
             painter.setPen(QPen(self.left_color, 2))
             
             # Convert boundary points to display coordinates
@@ -223,7 +235,7 @@ class TrackCanvas(QWidget):
                         QPointF(*self.transform_point(p1[0], p1[1]))
                     )
 
-        if self.right_boundary and len(self.right_boundary) > 1:
+        if show_track_geometry and self.right_boundary and len(self.right_boundary) > 1:
             painter.setPen(QPen(self.right_color, 2))
             
             # Convert boundary points to display coordinates
@@ -288,6 +300,26 @@ class TrackCanvas(QWidget):
                     display_pt = QPointF(*self.transform_point(pt[0], pt[1]))
                 painter.drawEllipse(display_pt, 3, 3)
 
+        if self.editor_mode == "cone":
+            def draw_cone_polyline(cones, color):
+                if cones is None:
+                    return
+                display_points = []
+                for pt in cones:
+                    if isinstance(pt, QPointF):
+                        display_points.append(QPointF(*self.transform_point(pt.x(), pt.y())))
+                    else:
+                        display_points.append(QPointF(*self.transform_point(pt[0], pt[1])))
+                if len(display_points) > 1:
+                    pen = QPen(color, 2)
+                    painter.setPen(pen)
+                    poly_points = list(display_points)
+                    poly_points.append(display_points[0])
+                    painter.drawPolyline(QPolygonF(poly_points))
+
+            draw_cone_polyline(self.left_cones, self.left_color)
+            draw_cone_polyline(self.right_cones, self.right_color)
+
         # Draw barriers (transform from map to display coords)
         if self.barrier_polygon is not None:
             # Draw barrier polygon
@@ -346,6 +378,9 @@ class TrackCanvas(QWidget):
             self.pan_start = event.pos()
             self.update()
         elif self.parent.dragging:
+            map_pos = self.screen_to_map(event.pos())
+            self.parent.handle_canvas_drag(QPointF(map_pos.x(), map_pos.y()))
+        elif self.parent.cone_dragging:
             map_pos = self.screen_to_map(event.pos())
             self.parent.handle_canvas_drag(QPointF(map_pos.x(), map_pos.y()))
         elif self.parent.dragging_barrier:
