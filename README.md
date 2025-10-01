@@ -25,10 +25,10 @@ You can follow the steps below to create your track and use it for simulations.
 
 Before starting, ensure you have the following:
 
-1. **Python 3** installed with the following dependencies:
+1. **Python >=3.10** installed, dependencies in ```requirements.txt```:
 
    ```bash
-   pip install numpy scipy pandas matplotlib shapely pyyaml PyQt5
+   pip install -r requirements.txt
    ```
 
 2. A **Google Maps** screenshot of your location with the scale legend visible. You will need this for drawing the track and scaling.
