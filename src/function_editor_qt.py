@@ -104,8 +104,10 @@ class FunctionCanvas(QWidget):
         # Grid lines
         painter.setPen(QPen(QColor(80, 80, 80)))
         for i in range(1, 5):
-            painter.drawLine(x0 + i * w / 5.0, y0, x0 + i * w / 5.0, y0 + h)
-            painter.drawLine(x0, y0 + i * h / 5.0, x0 + w, y0 + i * h / 5.0)
+            x = x0 + i * w / 5.0
+            y = y0 + i * h / 5.0
+            painter.drawLine(QPointF(x, y0), QPointF(x, y0 + h))
+            painter.drawLine(QPointF(x0, y), QPointF(x0 + w, y))
 
         # Labels
         painter.setPen(QPen(QColor(220, 220, 220)))
