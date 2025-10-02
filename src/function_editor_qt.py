@@ -140,9 +140,9 @@ class FunctionCanvas(QWidget):
         # Value scale annotations
         painter.setPen(QPen(QColor(160, 160, 160)))
         for frac in np.linspace(0, 1, 5):
-            value = v_min + frac * (v_max - v_min)
-            y = y0 + (1 - frac) * h
-            painter.drawText(x0 - 35, y + 5, f"{value:.2f}")
+            value = float(v_min + frac * (v_max - v_min))
+            y = float(y0 + (1 - frac) * h)
+            painter.drawText(QPointF(float(x0 - 35), y + 5.0), f"{value:.2f}")
 
     # Interaction ---------------------------------------------------------
     def mousePressEvent(self, event):
@@ -256,15 +256,17 @@ class ReferenceCurveCanvas(QWidget):
 
         painter.setPen(QPen(QColor(80, 80, 80)))
         for i in range(1, 5):
-            painter.drawLine(x0 + i * w / 5.0, y0, x0 + i * w / 5.0, y0 + h)
-            painter.drawLine(x0, y0 + i * h / 5.0, x0 + w, y0 + i * h / 5.0)
+            x = float(x0 + i * w / 5.0)
+            y = float(y0 + i * h / 5.0)
+            painter.drawLine(QPointF(x, float(y0)), QPointF(x, float(y0 + h)))
+            painter.drawLine(QPointF(float(x0), y), QPointF(float(x0 + w), y))
 
         painter.setPen(QPen(QColor(220, 220, 220)))
         font = painter.font()
         font.setPointSize(9)
         painter.setFont(font)
-        painter.drawText(x0 - 30, y0 + h + 20, "Progress")
-        painter.drawText(x0 - 35, y0 - 10, self.title)
+        painter.drawText(QPointF(float(x0 - 30), float(y0 + h + 20)), "Progress")
+        painter.drawText(QPointF(float(x0 - 35), float(y0 - 10)), self.title)
 
         if self.progress.size >= 2:
             painter.setPen(QPen(QColor(255, 140, 0), 2))
@@ -287,10 +289,10 @@ class ReferenceCurveCanvas(QWidget):
                 last_pt = pt
 
         painter.setPen(QPen(QColor(160, 160, 160)))
-        for frac in np.linspace(0, 1, 5):
-            value = v_min + frac * span
-            y = y0 + (1 - frac) * h
-            painter.drawText(x0 - 35, y + 5, f"{value:.2f}")
+        for frac in np.linspace(0.0, 1.0, 5):
+            value = float(v_min + frac * span)
+            y_coord = float(y0 + (1.0 - frac) * h)
+            painter.drawText(QPointF(float(x0 - 35), y_coord + 5.0), f"{value:.2f}")
 
 class FunctionEditorDialog(QDialog):
     """Dialog presenting controls to edit a ParameterFunction."""
