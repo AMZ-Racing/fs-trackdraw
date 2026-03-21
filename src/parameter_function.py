@@ -26,9 +26,9 @@ class ParameterFunction:
     def set_control_points(self, control_points) -> None:
         """Replace control points with a new collection of (progress, value)."""
         if not control_points:
-            # fallback to default constant if nothing provided
             self.set_constant(self._default_value)
             return
+
         cleaned = []
         for progress, value in control_points:
             try:
@@ -36,32 +36,37 @@ class ParameterFunction:
                 v = float(value)
             except (TypeError, ValueError):
                 continue
-            # wrap progress into [0, 1)
-            p_wrapped = p % 1.0
-            cleaned.append((p_wrapped, v))
+            if not (np.isfinite(p) and np.isfinite(v)):
+                continue
+            if np.isclose(p, 1.0):
+                p_clamped = 1.0
+            else:
+                p_clamped = min(1.0, max(0.0, p % 1.0 if p < 0.0 or p > 1.0 else p))
+            cleaned.append((p_clamped, v))
+
         if not cleaned:
             self.set_constant(self._default_value)
             return
-        # ensure sorted by progress
+
         cleaned.sort(key=lambda item: item[0])
-        # merge duplicates by averaging values
         merged = []
         for p, v in cleaned:
             if not merged or abs(p - merged[-1][0]) > 1e-6:
                 merged.append([p, v])
             else:
                 merged[-1][1] = 0.5 * (merged[-1][1] + v)
-        # guarantee endpoints at 0 and 1
+
         if merged[0][0] > 1e-6:
             merged.insert(0, [0.0, merged[0][1]])
+        else:
+            merged[0][0] = 0.0
         if merged[-1][0] < 1.0 - 1e-6:
             merged.append([1.0, merged[-1][1]])
         else:
-            # snap to 1 exactly for stability
             merged[-1][0] = 1.0
-        # enforce equality of first and last values for periodic continuity
         merged[-1][1] = merged[0][1]
-        self._control_points = [(p, v) for p, v in merged]
+
+        self._control_points = [(float(p), float(v)) for p, v in merged]
         self._rebuild()
 
     def get_control_points(self):
@@ -77,10 +82,8 @@ class ParameterFunction:
         if progress.size == 0:
             return np.array([], dtype=float)
         progress_wrapped = np.mod(progress, 1.0)
-        # handle exact 1.0 by bringing back to 0 so np.interp wraps correctly
         progress_wrapped = np.where(np.isclose(progress_wrapped, 1.0), 0.0, progress_wrapped)
-        values = np.interp(progress_wrapped, self._xp, self._yp)
-        return values
+        return np.interp(progress_wrapped, self._xp, self._yp)
 
     def _rebuild(self) -> None:
         ctrl = self._control_points

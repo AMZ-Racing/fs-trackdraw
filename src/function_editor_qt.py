@@ -77,7 +77,7 @@ class FunctionCanvas(QWidget):
         span = max(1e-6, v_max - v_min)
         x = x0 + np.clip(progress, 0.0, 1.0) * w
         y = y0 + (1.0 - (value - v_min) / span) * h
-        return QPointF(x, y)
+        return QPointF(float(x), float(y))
 
     def screen_to_data(self, point: QPointF) -> Tuple[float, float]:
         x0, y0, w, h = self._content_rect()
@@ -142,7 +142,7 @@ class FunctionCanvas(QWidget):
         for frac in np.linspace(0, 1, 5):
             value = v_min + frac * (v_max - v_min)
             y = y0 + (1 - frac) * h
-            painter.drawText(x0 - 35, y + 5, f"{value:.2f}")
+            painter.drawText(QPointF(float(x0 - 35), float(y + 5)), f"{value:.2f}")
 
     # Interaction ---------------------------------------------------------
     def mousePressEvent(self, event):
@@ -256,8 +256,10 @@ class ReferenceCurveCanvas(QWidget):
 
         painter.setPen(QPen(QColor(80, 80, 80)))
         for i in range(1, 5):
-            painter.drawLine(x0 + i * w / 5.0, y0, x0 + i * w / 5.0, y0 + h)
-            painter.drawLine(x0, y0 + i * h / 5.0, x0 + w, y0 + i * h / 5.0)
+            x = x0 + i * w / 5.0
+            y = y0 + i * h / 5.0
+            painter.drawLine(QPointF(float(x), float(y0)), QPointF(float(x), float(y0 + h)))
+            painter.drawLine(QPointF(float(x0), float(y)), QPointF(float(x0 + w), float(y)))
 
         painter.setPen(QPen(QColor(220, 220, 220)))
         font = painter.font()
@@ -281,7 +283,7 @@ class ReferenceCurveCanvas(QWidget):
             for prog, val in zip(prog_sorted, val_sorted):
                 x = x0 + np.clip(prog, 0.0, 1.0) * w
                 y = y0 + (1.0 - (val - v_min) / span) * h
-                pt = QPointF(x, y)
+                pt = QPointF(float(x), float(y))
                 if last_pt is not None:
                     painter.drawLine(last_pt, pt)
                 last_pt = pt
@@ -290,7 +292,7 @@ class ReferenceCurveCanvas(QWidget):
         for frac in np.linspace(0, 1, 5):
             value = v_min + frac * span
             y = y0 + (1 - frac) * h
-            painter.drawText(x0 - 35, y + 5, f"{value:.2f}")
+            painter.drawText(QPointF(float(x0 - 35), float(y + 5)), f"{value:.2f}")
 
 class FunctionEditorDialog(QDialog):
     """Dialog presenting controls to edit a ParameterFunction."""
