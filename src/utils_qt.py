@@ -397,25 +397,33 @@ def compute_curvature_profile(centerline: np.ndarray, px_per_m: float) -> Tuple[
     if len(pts) < 3:
         return np.array([]), np.array([])
 
-    cumulative, _, total_length = _closed_path_metrics(pts)
+    pts_m = pts / float(px_per_m)
+    cumulative, segment_lengths, total_length = _closed_path_metrics(pts_m)
     if total_length <= 0:
         return np.array([]), np.array([])
 
-    try:
-        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=0, per=True)
-    except ValueError:
-        return np.array([]), np.array([])
+    sample_count = max(len(pts_m), 256)
+    sample_distances = np.linspace(0.0, total_length, sample_count, endpoint=False)
+    sampled = np.vstack(
+        [
+            _interpolate_on_closed_path(pts_m, cumulative, segment_lengths, distance)
+            for distance in sample_distances
+        ]
+    )
 
-    sample_count = len(pts)
-    u_samples = np.linspace(0, 1, sample_count, endpoint=False)
-    dx, dy = splev(u_samples, tck, der=1)
-    ddx, ddy = splev(u_samples, tck, der=2)
+    prev_pts = np.roll(sampled, 1, axis=0)
+    next_pts = np.roll(sampled, -1, axis=0)
+    seg_prev = sampled - prev_pts
+    seg_next = next_pts - sampled
+    chord = next_pts - prev_pts
 
-    numerator = np.abs(dx * ddy - dy * ddx)
-    denominator = (dx ** 2 + dy ** 2) ** 1.5
+    len_prev = np.linalg.norm(seg_prev, axis=1)
+    len_next = np.linalg.norm(seg_next, axis=1)
+    len_chord = np.linalg.norm(chord, axis=1)
+    twice_area = np.abs(seg_prev[:, 0] * seg_next[:, 1] - seg_prev[:, 1] * seg_next[:, 0])
+    denominator = len_prev * len_next * len_chord
     with np.errstate(divide='ignore', invalid='ignore'):
-        curvature_px = np.where(denominator > 1e-12, numerator / denominator, 0.0)
+        curvature_m = np.where(denominator > 1e-9, 2.0 * twice_area / denominator, 0.0)
 
-    curvature_m = curvature_px * px_per_m
-    progress = cumulative[:-1] / total_length
+    progress = sample_distances / total_length
     return progress.astype(float), curvature_m.astype(float)

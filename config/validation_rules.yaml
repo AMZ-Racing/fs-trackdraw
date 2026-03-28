@@ -1,0 +1,45 @@
+rules:
+  centerline_simple:
+    enabled: true
+    threshold: null
+    severity: error
+  left_boundary_simple:
+    enabled: true
+    threshold: null
+    severity: error
+  right_boundary_simple:
+    enabled: true
+    threshold: null
+    severity: error
+  boundaries_do_not_cross:
+    enabled: true
+    threshold: null
+    severity: error
+  cones_inside_area:
+    enabled: true
+    threshold: null
+    severity: error
+  min_clearance:
+    enabled: true
+    threshold: 1.0
+    severity: error
+  min_track_width:
+    enabled: true
+    threshold: 3.0
+    severity: error
+  min_centerline_radius:
+    enabled: true
+    threshold: 4.5
+    severity: error
+  min_cone_spacing:
+    enabled: true
+    threshold: 2.0
+    severity: error
+  max_cone_spacing:
+    enabled: true
+    threshold: 6.0
+    severity: warning
+  min_track_length:
+    enabled: true
+    threshold: 80.0
+    severity: warning
